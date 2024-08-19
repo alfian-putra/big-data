@@ -1,0 +1,102 @@
+Nifi MySQL to Kafka on secure environment
+
+a. Persiapan (service configuration)
+
+    Memberi akses user principal untuk consume dan publish kafka topic
+    1. Masuk ke ranger ui > access manager > {ambari-cluster-name}_kafka 
+    2. tambahkan user principal yang akan digunakan pada allow condition di policy, sebagai contoh akan digunakan keytab dengan [rincipal nifi maka perlu allow access user nifi pada) : 
+	        all - consumergroup
+            all - topic
+            all - transactionalid
+
+    Konfigurasi nifi untuk mengizinkan processor menggunakan keytab
+    3. masuk ke ambari ui > nifi > setting
+    4. pada nifi-env.sh tambahkan :
+            export NIFI_ALLOW_EXPLICIT_KEYTAB=true
+
+    Membuat Mysql database yang akan dibaca datanya
+    5. masuk ke host mysql server 
+    6. sebagai contoh digunakan sql dari sumber berikut : https://sample-videos.com/sql/Sample-SQL-File-1000rows.sql
+       run perintah berikut sebagai user root :
+            cd /tmp
+            wget https://sample-videos.com/sql/Sample-SQL-File-1000rows.sql
+            chmod +r /tmp/Sample-SQL-File-1000rows.sql
+    7. masuk ke mysql console kemudian run query berikut :
+            CREATE DATABASE {db_name};
+            create user  'root'@'{nifi_host}';
+            GRANT ALL PRIVILEGES ON user_details.* TO '{db_user}'@'{nifi_host}';
+            use {db_name};
+            source /root/Sample-SQL-File-1000rows.sql;
+
+    Siapkan jdbc Driver
+    8. download jdbc driver
+            cd /tmp
+            wget https://repo1.maven.org/maven2/com/mysql/mysql-connector-j/8.0.31/mysql-connector-j-8.0.31.jar 
+            chmod 777 /tmp/mysql-connector-j-8.0.31.jar
+
+    Membuat Kafka topic untuk publish data 
+    9. masuk ke host kafka, gunakan user kafka
+            su kafka
+    10. buat topic
+            source /usr/yava/current/kafka-broker/config/kafka-env.sh ;\
+            /usr/yava/current/kafka-broker/bin/kafka-topics.sh \
+            --bootstrap-server {host-kafka}:{port_kafka_broker} \
+            --command-config /usr/yava/current/kafka-broker/config/server.properties \
+            --create --topic {topic_name} \
+            --replication-factor 1 --partitions 1
+
+          
+b. Membuat dataflow 
+    ** Untuk membuat processor drag and drop processor dari header navbar nifi ui, kemudikan jenis processor 
+    ** untuk membuat relationship, sorot processor pada icon yang muncul drag and drop ke tujuan relasi, kemudikan isikan pada kondisi apa data melewati relasi tersebut
+
+    Membuat processor queryDatabaseTable 
+    11. buat processor QueryDatabaseTable
+    12. pada "Database Connection Pooling Service" pilih Create new service, klik create, klik ok.
+    13. Setelah kembali ke configure processor klik tanda panah bagian kanan service yang baru saja dibuat
+    14. klik configure (icon gear) > properties isikan :
+            Database Connection URL  >  jdbc:mysql://{host_mysql_server}:{port}/{db}
+            Database Driver Class Name >  com.mysql.jdbc.Driver
+            Database Driver Location(s) >  /tmp/mysql-connector-j-8.0.31.jar
+            Database user       >   {db_user} 
+            Password       >  {db_user_password/kosong jika tidak menggunakan password}
+    15. klik apply
+    16. klik enable
+
+    Membuat processor ConvertAvroToJackson
+    17. buat processor convertAvroToJackson
+    18. pada properties isikan :
+            JSON container options  >  array
+            Wrap Single Record   >  false
+    
+    Membuat processor SplitJson
+    19. buat processor SplitJson
+    20. pada properties ubah
+            JsonPath Expression     >     $.*
+            Null Value Representation       >   empty string
+
+    Membuat processor PublishKafka_2_6 1.23.2
+    21. buat processor PublishKafka_2_6 1.23.2
+    22. pada properties isikan 
+            Kafka Brokers   >   {host_kafka_broker}:{port}  
+            Topic Name    >   {topic_name}
+            Use Transactions    >   false
+            Failure Strategy    >   Route to Failure
+            Delivery Guarantee     >    Guarantee Replicated Delivery
+            Message Header Encoding     >   UTF-8
+            Security Protocol       >   SASL_PLAINTEXT
+            SASL Mechanism      >   GSSAPI
+            Kerberos Service Name   >   kafka
+            Kerberos Principal  >   {principal} >  contoh: nifi/n38.labs247.com@LABS247.COM
+            Kerberos Keytab     >   {keytab}    >  contoh: /etc/security/keytabs/nifi.service.keytab
+        * catatan : pastikan permission keytab agar bisa dibaca oleh user nifi (user di linux server), gunakan keytab dengan principal yang terdaftar sebagai user di ranger <pada contoh digunakan principal nifi>
+    23. pada tab relationship 
+            failure > terminate
+            success > terminate
+
+    Membuat relationship sebagai berikut
+        success dari QueryDatabaseTable > ConvertAvroToJackson
+        success dari ConvertAvroToJackson > SplitJson
+        failure dari ConvertAvroToJackson > ConvertAvroToJackson 
+        failure, original dari SplitJson > SplitJson
+        split dari SplitJson > PublishKafka_2_6 1.23.2
